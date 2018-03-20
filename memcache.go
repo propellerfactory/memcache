@@ -325,6 +325,9 @@ type Item struct {
 
 	// Compare and swap ID.
 	casid uint64
+
+	// The length of the item if Value is nil (i.e. for stream calls)
+	Length uint32
 }
 
 // conn is a connection to a server.
@@ -455,6 +458,35 @@ func (c *Client) Get(key string) (*Item, error) {
 	return c.parseItemResponse(key, cn, true)
 }
 
+type readCloser struct {
+	c  *Client
+	cn *conn
+}
+
+func (r *readCloser) Read(p []byte) (int, error) {
+	return r.cn.nc.Read(p)
+}
+
+func (r *readCloser) Close() error {
+	r.c.putFreeConn(r.cn)
+	return nil
+}
+
+func (r *readCloser) CloseErr(err error) error {
+	r.c.condRelease(r.cn, &err)
+	return err
+}
+
+// Get gets the item for the given key. ErrCacheMiss is returned for a
+// memcache cache miss. The key must be at most 250 bytes in length.
+func (c *Client) GetStream(key string) (*Item, io.ReadCloser, error) {
+	cn, err := c.sendCommand(key, cmdGet, nil, 0, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c.parseItemResponseStream(key, cn)
+}
+
 func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64, extras []byte) (*conn, error) {
 	addr, err := c.servers.PickServer(key)
 	if err != nil {
@@ -465,6 +497,23 @@ func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64
 		return nil, err
 	}
 	err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
+	if err != nil {
+		cn.nc.Close()
+		return nil, err
+	}
+	return cn, err
+}
+
+func (c *Client) sendCommandStream(key string, cmd command, body io.Reader, vl uint32, casid uint64, extras []byte) (*conn, error) {
+	addr, err := c.servers.PickServer(key)
+	if err != nil {
+		return nil, err
+	}
+	cn, err := c.getConn(addr)
+	if err != nil {
+		return nil, err
+	}
+	err = c.sendConnCommandStream(cn, key, cmd, body, vl, casid, extras)
 	if err != nil {
 		cn.nc.Close()
 		return nil, err
@@ -523,6 +572,56 @@ func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte
 	return nil
 }
 
+func (c *Client) sendConnCommandStream(cn *conn, key string, cmd command, body io.Reader, vl uint32, casid uint64, extras []byte) (err error) {
+	var buf []byte
+	select {
+	// 24 is header size
+	case buf = <-c.bufPool:
+		buf = buf[:24]
+	default:
+		buf = make([]byte, 24, 24+len(key)+len(extras))
+		// Magic (0)
+		buf[0] = reqMagic
+	}
+	// Command (1)
+	buf[1] = byte(cmd)
+	kl := len(key)
+	el := len(extras)
+	// Key length (2-3)
+	putUint16(buf[2:], uint16(kl))
+	// Extras length (4)
+	buf[4] = byte(el)
+	// Data type (5), always zero
+	// VBucket (6-7), always zero
+	// Total body length (8-11)
+	bl := uint32(kl+el) + vl
+	putUint32(buf[8:], bl)
+	// Opaque (12-15), always zero
+	// CAS (16-23)
+	putUint64(buf[16:], casid)
+	// Extras
+	if el > 0 {
+		buf = append(buf, extras...)
+	}
+	if kl > 0 {
+		// Key itself
+		buf = append(buf, stobs(key)...)
+	}
+	if _, err = cn.nc.Write(buf); err != nil {
+		return err
+	}
+	select {
+	case c.bufPool <- buf:
+	default:
+	}
+	if vl > 0 {
+		if _, err = io.Copy(cn.nc, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, []byte, error) {
 	var err error
 	hdr := make([]byte, 24)
@@ -570,6 +669,46 @@ func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, [
 	return hdr, key, extras, value, nil
 }
 
+func (c *Client) parseResponseStream(rKey string, cn *conn) ([]byte, []byte, []byte, uint32, error) {
+	var err error
+	hdr := make([]byte, 24)
+	if err = readAtLeast(cn.nc, hdr, 24); err != nil {
+		return nil, nil, nil, 0, err
+	}
+	if hdr[0] != respMagic {
+		return nil, nil, nil, 0, ErrBadMagic
+	}
+	total := int(bUint32(hdr[8:12]))
+	status := bUint16(hdr[6:8])
+	if status != respOk {
+		if _, err = io.CopyN(ioutil.Discard, cn.nc, int64(total)); err != nil {
+			return nil, nil, nil, 0, err
+		}
+		if status == respInvalidArgs && !legalKey(rKey) {
+			return nil, nil, nil, 0, ErrMalformedKey
+		}
+		return nil, nil, nil, 0, response(status).asError()
+	}
+	var extras []byte
+	el := int(hdr[4])
+	if el > 0 {
+		extras = make([]byte, el)
+		if err = readAtLeast(cn.nc, extras, el); err != nil {
+			return nil, nil, nil, 0, err
+		}
+	}
+	var key []byte
+	kl := int(bUint16(hdr[2:4]))
+	if kl > 0 {
+		key = make([]byte, int(kl))
+		if err = readAtLeast(cn.nc, key, kl); err != nil {
+			return nil, nil, nil, 0, err
+		}
+	}
+	vl := total - el - kl
+	return hdr, key, extras, uint32(vl), nil
+}
+
 func (c *Client) parseUintResponse(key string, cn *conn) (uint64, error) {
 	_, _, _, value, err := c.parseResponse(key, cn)
 	c.condRelease(cn, &err)
@@ -600,6 +739,28 @@ func (c *Client) parseItemResponse(key string, cn *conn, release bool) (*Item, e
 		Flags: flags,
 		casid: bUint64(hdr[16:24]),
 	}, nil
+}
+
+func (c *Client) parseItemResponseStream(key string, cn *conn) (*Item, io.ReadCloser, error) {
+	hdr, k, extras, length, err := c.parseResponseStream(key, cn)
+	if err != nil {
+		return nil, nil, err
+	}
+	var flags uint32
+	if len(extras) > 0 {
+		flags = bUint32(extras)
+	}
+	if key == "" && len(k) > 0 {
+		key = string(k)
+	}
+	return &Item{
+			Key:    key,
+			Flags:  flags,
+			Length: length,
+			casid:  bUint64(hdr[16:24]),
+		}, &readCloser{
+			c: c, cn: cn,
+		}, nil
 }
 
 // GetMulti is a batch version of Get. The returned map from keys to
@@ -667,6 +828,17 @@ func (c *Client) Add(item *Item) error {
 	return c.populateOne(cmdAdd, item, 0)
 }
 
+// Set writes the given item, unconditionally.
+func (c *Client) SetStream(item *Item, body io.Reader) error {
+	return c.populateOneStream(cmdSet, item, body, 0)
+}
+
+// Add writes the given item, if no value already exists for its
+// key. ErrNotStored is returned if that condition is not met.
+func (c *Client) AddStream(item *Item, body io.Reader) error {
+	return c.populateOneStream(cmdAdd, item, body, 0)
+}
+
 // CompareAndSwap writes the given item that was previously returned
 // by Get, if the value was neither modified or evicted between the
 // Get and the CompareAndSwap calls. The item's Key should not change
@@ -683,6 +855,24 @@ func (c *Client) populateOne(cmd command, item *Item, casid uint64) error {
 	putUint32(extras, item.Flags)
 	putUint32(extras[4:8], uint32(item.Expiration))
 	cn, err := c.sendCommand(item.Key, cmd, item.Value, casid, extras)
+	if err != nil {
+		return err
+	}
+	hdr, _, _, _, err := c.parseResponse(item.Key, cn)
+	if err != nil {
+		c.condRelease(cn, &err)
+		return err
+	}
+	c.putFreeConn(cn)
+	item.casid = bUint64(hdr[16:24])
+	return nil
+}
+
+func (c *Client) populateOneStream(cmd command, item *Item, body io.Reader, casid uint64) error {
+	extras := make([]byte, 8)
+	putUint32(extras, item.Flags)
+	putUint32(extras[4:8], uint32(item.Expiration))
+	cn, err := c.sendCommandStream(item.Key, cmd, body, item.Length, casid, extras)
 	if err != nil {
 		return err
 	}
