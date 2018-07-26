@@ -459,12 +459,22 @@ func (c *Client) Get(key string) (*Item, error) {
 }
 
 type readCloser struct {
-	c  *Client
-	cn *conn
+	c      *Client
+	cn     *conn
+	length uint32
+	read   uint32
 }
 
 func (r *readCloser) Read(p []byte) (int, error) {
-	return r.cn.nc.Read(p)
+	n, err := r.cn.nc.Read(p)
+	if err != nil {
+		return n, err
+	}
+	r.read = r.read + uint32(n)
+	if r.read == r.length {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func (r *readCloser) Close() error {
@@ -759,7 +769,7 @@ func (c *Client) parseItemResponseStream(key string, cn *conn) (*Item, io.ReadCl
 			Length: length,
 			casid:  bUint64(hdr[16:24]),
 		}, &readCloser{
-			c: c, cn: cn,
+			c: c, cn: cn, length: length,
 		}, nil
 }
 
